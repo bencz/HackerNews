@@ -97,8 +97,8 @@ With several replicas, you don't want each one fetching from HackerNews on its o
 
 - **Single writer per cycle.** Every `RefreshIntervalSeconds` each pod tries to take a Redis lock (`SET NX PX`, waiting up to `LockWaitSeconds`). Whoever wins checks the last update time: if the snapshot is stale it refreshes from HackerNews, otherwise it does nothing. Pods that lose the lock skip the cycle. The upstream API is hit at most once per interval, regardless of replica count.
 - **Shared store.** The snapshot, a monotonic `version`, and `updatedAt` live in a Redis hash (`beststories:state`), written atomically by a Lua script.
-- **Propagation.** After a refresh the writer publishes the new `version` on the `beststories:updates` channel. Each pod's subscriber reads the snapshot from Redis and swaps its L1, skipping versions it already has.
-- **Cold start and missed messages.** A new or restarted pod loads its L1 from Redis on boot (no HackerNews call), then subscribes. A periodic re-check covers any message missed during a disconnect.
+- **Propagation.** After a refresh the writer publishes the whole snapshot on the `beststories:updates` channel. Each pod's subscriber takes it straight from the message and swaps its L1, skipping versions it already has. No extra Redis read on this path.
+- **Cold start and missed messages.** A new or restarted pod loads its L1 from Redis on boot (no HackerNews call), then subscribes. On reconnect it reloads from Redis, covering anything missed while it was disconnected.
 - **Graceful degradation.** Reads never touch Redis, so if Redis goes down each pod keeps serving its last snapshot. The connection is a singleton with `AbortOnConnectFail=false` and reconnects on its own.
 
 Redis settings live under the `Redis` section:
@@ -128,8 +128,8 @@ for i in $(seq 1 9); do curl -s "http://localhost:8080/api/v1/stories/best?n=200
 docker exec hn-redis redis-cli HGET beststories:state version
 docker exec hn-redis redis-cli SUBSCRIBE beststories:updates
 
-# cold start: a restarted pod warms from Redis (look for "Applied snapshot version N" in its log)
-docker compose restart api2 && docker logs hn-api2 2>&1 | grep "Applied snapshot"
+# cold start: a restarted pod warms from Redis (look for "Primed snapshot version N" in its log)
+docker compose restart api2 && docker logs hn-api2 2>&1 | grep "Primed snapshot"
 
 docker compose down -v
 ```
@@ -236,32 +236,34 @@ With `Redis:Enabled = true` the service runs as N replicas without changing the 
 **Two cache tiers:**
 
 - **L1 (per pod).** The same lock-free `BestStoriesCache`. All HTTP reads come from L1, in-process, with no Redis call on the request path.
-- **L2 (Redis).** A hash `beststories:state` with the JSON `payload`, a monotonic `version`, and `updatedAt`. It survives restarts and lets a fresh pod catch up right away.
+- **L2 (Redis).** A hash `beststories:state` with the JSON `payload`, a monotonic `version`, and `updatedAt`. It survives restarts and lets a fresh pod catch up right away. It is read only on cold start and reconnect, never on the request path.
 
 **Single writer per cycle.** Every `RefreshIntervalSeconds` each pod tries the lock (`SET beststories:lock <token> NX PX`, waiting up to `LockWaitSeconds`). The winner reads `updatedAt`: if the snapshot is still within the interval it does nothing, otherwise it runs the usual fetch, writes L2 atomically (a Lua script doing `HINCRBY version` plus `HSET payload, updatedAt`), and publishes the new version. Losers skip the cycle. The lock is released with a Lua compare-and-delete, so a pod never frees a lease it no longer owns. The write is idempotent and last-writer-wins on the monotonic version, so a rare double-write under a GC pause is harmless. The lock only avoids redundant upstream load; it is not a safety-critical mutex.
 
-**Propagation by notification, not payload.** The message on `beststories:updates` is just the version number. Each pod's `SnapshotSubscriberService` compares it to the version it last applied and, if newer, reads L2 once and swaps L1. A tiny message avoids Pub/Sub back-pressure, and the same "load then swap" routine handles cold start and reconnection too.
+**Propagation by Pub/Sub.** The message on `beststories:updates` carries the full snapshot (version, stories, updatedAt). Each pod's `SnapshotSubscriberService` compares the version to the one it last applied and, if newer, swaps L1 straight from the message, with no second trip to Redis. The payload is small (around 46 KB, once a minute), so shipping it on the channel beats making every pod fetch it again. L2 stays authoritative, but only for cold start and reconnect.
 
-**Cold start and missed messages.** On boot a pod loads L1 straight from L2 (no HackerNews call), then subscribes, so it serves correct data immediately and `/health/ready` turns healthy as soon as the snapshot is loaded. A periodic re-check of the version catches anything missed during a disconnect.
+**Cold start and missed messages.** On boot a pod loads L1 straight from L2 (no HackerNews call), then subscribes, so it serves correct data immediately and `/health/ready` turns healthy as soon as the snapshot is loaded. On reconnect it reloads from L2, catching anything published while it was disconnected.
 
 ```
 Each pod, every RefreshIntervalSeconds:
   TryAcquire(beststories:lock, NX PX, wait <= LockWaitSeconds)
     lost -> skip this cycle (L1 stays fresh via Pub/Sub)
     won  -> if now - updatedAt < interval: release, skip
-            else: fetch HN -> build snapshot -> cache.Update() (local L1)
+            else: fetch HN -> build snapshot -> cache.TryUpdate() (local L1)
                   -> Lua: HINCRBY version + HSET payload, updatedAt
-                  -> PUBLISH beststories:updates <version> -> release lock
+                  -> PUBLISH beststories:updates <snapshot> -> release lock
 
 Every pod (subscriber):
-  on message <version> (or periodic re-check, or on boot):
-    if version > appliedVersion: load beststories:state -> cache.Update() (L1)
+  on message <snapshot>:
+    if version > appliedVersion: cache.TryUpdate(snapshot) (L1, no Redis read)
+  on boot or reconnect:
+    load beststories:state -> cache.TryUpdate() (L1)
 
 Any pod (HTTP request):
   Kestrel -> Controller -> cache.Current (volatile read, in-process) -> Response
 ```
 
-The read path is the same in every pod and never touches Redis. `IBestStoriesCacheWriter.Update()` is called either by the local refresh (the pod that won the lock) or by the subscriber (every other pod); the lock-free snapshot swap doesn't change.
+The read path is the same in every pod and never touches Redis. `IBestStoriesCacheWriter.TryUpdate()` is called either by the local refresh (the pod that won the lock) or by the subscriber (every other pod); the lock-free snapshot swap doesn't change.
 
 **Why an in-pod lock.** One image, no extra Deployment, no internal endpoint to protect, and any pod can take over if another dies. A Kubernetes `CronJob` calling an internal `POST /internal/refresh` (with `concurrencyPolicy: Forbid`), or a dedicated single-replica worker, are valid alternatives that move the trigger out of the API pods, and both can reuse the same L2 and Pub/Sub. The lock was chosen here for simplicity.
 
