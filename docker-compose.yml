@@ -1,0 +1,66 @@
+name: hackernews-dist
+
+x-api-common: &api-common
+  build:
+    context: .
+    dockerfile: src/HackerNews.Api/Dockerfile
+  image: hackernews-api:dist
+  restart: unless-stopped
+  depends_on:
+    redis:
+      condition: service_healthy
+  environment: &api-env
+    ASPNETCORE_ENVIRONMENT: "Production"
+    ASPNETCORE_HTTP_PORTS: "8080"
+    HackerNews__RefreshIntervalSeconds: "30"
+    Redis__Enabled: "true"
+    Redis__ConnectionString: "redis:6379"
+    Redis__KeyPrefix: "beststories"
+    Redis__LockTtlSeconds: "30"
+    Redis__LockWaitSeconds: "5"
+  networks: [hn]
+
+services:
+  redis:
+    image: redis:alpine
+    container_name: hn-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [hn]
+
+  api1:
+    <<: *api-common
+    container_name: hn-api1
+
+  api2:
+    <<: *api-common
+    container_name: hn-api2
+
+  api3:
+    <<: *api-common
+    container_name: hn-api3
+
+  nginx:
+    image: nginx:alpine
+    container_name: hn-nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api1: { condition: service_started }
+      api2: { condition: service_started }
+      api3: { condition: service_started }
+    networks: [hn]
+
+networks:
+  hn:
+    driver: bridge
